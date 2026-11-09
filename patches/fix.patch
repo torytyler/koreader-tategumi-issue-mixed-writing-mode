@@ -1,0 +1,260 @@
+diff --git a/crengine/include/lvpagesplitter.h b/crengine/include/lvpagesplitter.h
+index 216f93b..a4d72b2 100644
+--- a/crengine/include/lvpagesplitter.h
++++ b/crengine/include/lvpagesplitter.h
+@@ -54,6 +54,15 @@
+ 
+ #define RN_SPLIT_DISCARD_AT_START 0x400
+ 
++// FORK (tategumi): marks a forced page break that also changes the writing
++// mode (a DocFragment whose writing-mode differs from the flow's). Such a
++// break must be honored even if the adjacent line is flagged with an "avoid"
++// (e.g. an image line), because each page is laid out/painted in a single
++// writing mode: dropping it makes the next fragment's content share the
++// previous page and overlap it. See vertical_cover_page_spec.lua for the
++// same-mode case, where sharing a page with text is expected to be kept.
++#define RN_SPLIT_MODE_CHANGE 0x800
++
+ #define RN_LINE_IS_RTL 0x1000
+ 
+ #define RN_GET_SPLIT_BEFORE(flags) ((flags >> RN_SPLIT_BEFORE) & 0x7)
+diff --git a/crengine/src/lvpagesplitter.cpp b/crengine/src/lvpagesplitter.cpp
+index 0b3ad55..45d29cb 100644
+--- a/crengine/src/lvpagesplitter.cpp
++++ b/crengine/src/lvpagesplitter.cpp
+@@ -1324,8 +1324,18 @@ public:
+                 int cur_after = cur_line->getSplitAfter();
+                 int nxt_before = nxt_line->getSplitBefore();
+                 if ( cur_after==RN_SPLIT_AVOID || nxt_before==RN_SPLIT_AVOID) {
+-                    // Should stick together
+-                    continue;
++                    // Should stick together, unless a FORK (tategumi) forced
++                    // break that also changes the writing mode sits on one of
++                    // these lines: such a break delimits the page's writing
++                    // mode, so it must win over the adjacent "avoid" (e.g. an
++                    // image line). Without this, the next fragment would be
++                    // laid out on the previous page and, in vertical-rl, be
++                    // painted over it.
++                    bool mode_change_break =
++                        ( ( cur_after==RN_SPLIT_ALWAYS && (cur_line->flags & RN_SPLIT_MODE_CHANGE) )
++                       || ( nxt_before==RN_SPLIT_ALWAYS && (nxt_line->flags & RN_SPLIT_MODE_CHANGE) ) );
++                    if ( !mode_change_break )
++                        continue;
+                 }
+                 nxt_line_start = nxt_line->getStart();
+                 if ( nxt_line_start < cur_line->getEnd() ) {
+diff --git a/crengine/src/lvrend.cpp b/crengine/src/lvrend.cpp
+index b93fa20..c89561f 100644
+--- a/crengine/src/lvrend.cpp
++++ b/crengine/src/lvrend.cpp
+@@ -6213,6 +6213,9 @@ private:
+     bool avoid_pb_inside_just_toggled_off;
+     bool seen_content_since_page_split; // to avoid consecutive page split when only empty or padding in between
+     bool force_next_content_split_before;
++    // FORK (tategumi): the pending forced break also changes the writing mode,
++    // so the page splitter must not let an adjacent "avoid" swallow it.
++    bool force_next_content_split_mode_change;
+     int  last_split_after_flag; // in case we need to adjust upcoming line's flag vs previous line's
+     bool in_non_linear_sequence;
+     bool in_combining_non_linear_sequence;
+@@ -6227,6 +6230,7 @@ private:
+     ldomNode * vm_target_node;     // target element that will be shifted by the collapsed margin
+     int  vm_target_level;          // level of this target node
+     int  vm_active_pb_flag;        // page-break flag for the whole margin
++    bool vm_active_pb_mode_change; // FORK (tategumi): this break also changes the writing mode
+     int  vm_max_positive_margin;
+     int  vm_max_negative_margin;
+     int  vm_back_usable_as_margin; // previously moved vertical space where next margin could be accounted in
+@@ -6260,6 +6264,7 @@ public:
+         avoid_pb_inside_just_toggled_off(false),
+         seen_content_since_page_split(false),
+         force_next_content_split_before(false),
++        force_next_content_split_mode_change(false),
+         last_split_after_flag(RN_SPLIT_AUTO),
+         in_non_linear_sequence(false),
+         in_combining_non_linear_sequence(false),
+@@ -6272,6 +6277,7 @@ public:
+         vm_target_node(NULL),
+         vm_target_level(0),
+         vm_active_pb_flag(RN_SPLIT_AUTO),
++        vm_active_pb_mode_change(false),
+         vm_max_positive_margin(0),
+         vm_max_negative_margin(0),
+         vm_back_usable_as_margin(0)
+@@ -6698,6 +6704,10 @@ public:
+         }
+         if ( force_next_content_split_before ) {
+             flags = setSplitBeforeAlways(flags);
++            if ( force_next_content_split_mode_change ) {
++                flags |= RN_SPLIT_MODE_CHANGE;
++                force_next_content_split_mode_change = false;
++            }
+             force_next_content_split_before = false;
+         }
+         // Most often for content lines, lvtextfm.cpp's LVFormatter will
+@@ -6785,6 +6795,7 @@ public:
+         vm_max_positive_margin = 0;
+         vm_max_negative_margin = 0;
+         vm_active_pb_flag = RN_SPLIT_AUTO;
++        vm_active_pb_mode_change = false;
+         vm_back_usable_as_margin = 0;
+     }
+     void enableVerticalMargin() {
+@@ -6792,7 +6803,8 @@ public:
+         // Also drop any back margin added since disabling
+         vm_back_usable_as_margin = 0;
+     }
+-    void addVerticalMargin( ldomNode * node, int height, int pb_flag, bool is_top_margin=false ) {
++    void addVerticalMargin( ldomNode * node, int height, int pb_flag, bool is_top_margin=false,
++                            bool mode_change=false ) {
+         if ( vm_disabled ) { // ignore that margin, unless it asks for a page split
+             if ( pb_flag != RN_SPLIT_ALWAYS ) {
+                 return;
+@@ -6875,6 +6887,8 @@ public:
+                 }
+                 vm_active_pb_flag = RN_SPLIT_ALWAYS;
+             }
++            if ( mode_change && vm_active_pb_flag == RN_SPLIT_ALWAYS )
++                vm_active_pb_mode_change = true;
+         }
+         else if ( pb_flag == RN_SPLIT_AVOID ) {
+             if ( vm_active_pb_flag != RN_SPLIT_ALWAYS )
+@@ -6986,9 +7000,15 @@ public:
+         // at bottom of page before a split (where a non-fully discarded margin would
+         // otherwise allow some now-white background to be painted on the whole page).
+ 
+-        if (is_main_flow && margin < 0) { // can only happen if ALLOW_NEGATIVE_COLLAPSED_MARGINS
++        if (is_main_flow && margin < 0 && vm_active_pb_flag != RN_SPLIT_ALWAYS) {
++            // can only happen if ALLOW_NEGATIVE_COLLAPSED_MARGINS
+             // We're moving backward and don't know what was before and what's
+             // coming next. Add an empty line to avoid a split there.
++            // With a pending forced break we use the branch below instead: at a
++            // forced break the relevant margin is set to 0, which also keeps the
++            // next page from starting before the end of the previous one (a
++            // negative margin here used to drag the next fragment back by a few
++            // pixels, so its first line landed on the previous page).
+             context.AddLine( flowPos(), flowPos(), RN_SPLIT_BOTH_AVOID|line_dir_flag );
+         }
+         else if (is_main_flow) {
+@@ -7013,6 +7033,7 @@ public:
+                     margin = 0;
+                     flags = RN_SPLIT_BEFORE_ALWAYS | RN_SPLIT_AFTER_AVOID;
+                     force_next_content_split_before = true;
++                    force_next_content_split_mode_change = vm_active_pb_mode_change;
+                     emit_empty = false;
+                 }
+                 else { // no target node: only bottom margin with some break-after
+@@ -7022,7 +7043,8 @@ public:
+                     // propagate into the next page", which has a margin-bottom: 1000em
+                     // that would make 37 pages - but these 1000em would still be ensured
+                     // in scroll mode if we were not limiting a margin to max page_height.)
+-                    flags = RN_SPLIT_BEFORE_AUTO | RN_SPLIT_AFTER_ALWAYS | RN_SPLIT_DISCARD_AT_START;
++                    flags = RN_SPLIT_BEFORE_AUTO | RN_SPLIT_AFTER_ALWAYS | RN_SPLIT_DISCARD_AT_START
++                            | ( vm_active_pb_mode_change ? RN_SPLIT_MODE_CHANGE : 0 );
+                 }
+                 // Note: floats must have been cleared before calling us if a page-break
+                 // has to happen.
+@@ -7224,6 +7246,7 @@ public:
+         vm_max_positive_margin = 0;
+         vm_max_negative_margin = 0;
+         vm_active_pb_flag = RN_SPLIT_AUTO;
++        vm_active_pb_mode_change = false;
+         vm_has_some = false;
+         if ( BLOCK_RENDERING(rend_flags, DO_NOT_CLEAR_OWN_FLOATS) && _floats.length()>0 ) {
+             // We did not clear floats, so we may meet them again when
+@@ -9200,6 +9223,7 @@ void renderBlockElementEnhanced( FlowState * flow, ldomNode * enode, int x, int
+         break_before = RN_SPLIT_ALWAYS;
+     }
+ 
++    bool fork_mode_change_break = false;
+     // === FORK (mixed writing modes) =========================================
+     // If this block carries an explicit writing-mode that differs from the
+     // flow's current mode (e.g. a horizontal-tb author-bio / colophon / ad
+@@ -9217,6 +9241,7 @@ void renderBlockElementEnhanced( FlowState * flow, ldomNode * enode, int x, int
+         flow->switchWritingMode( style->writing_mode );
+         break_before = RN_SPLIT_ALWAYS;
+         break_after = RN_SPLIT_ALWAYS;
++        fork_mode_change_break = true;
+     }
+     // If we have a carried initial-letter still active, and we meet a block
+     // with HasFirstLetter (which may or may not be an initial-letter), clear
+@@ -9233,7 +9258,7 @@ void renderBlockElementEnhanced( FlowState * flow, ldomNode * enode, int x, int
+     }
+     // We don't shift y yet. We accumulate margin, and, after ensuring
+     // collapsing, emit it on the first non-margin real content added.
+-    flow->addVerticalMargin( enode, margin_top, break_before, true ); // is_top_margin=true
++    flow->addVerticalMargin( enode, margin_top, break_before, true, fork_mode_change_break ); // is_top_margin=true
+ 
+     LFormattedTextRef txform;
+ 
+@@ -9396,7 +9421,7 @@ void renderBlockElementEnhanced( FlowState * flow, ldomNode * enode, int x, int
+                 if ( isFootNoteBody )
+                     flow->getPageContext()->leaveFootNote();
+ 
+-                flow->addVerticalMargin( enode, margin_bottom, break_after );
++                flow->addVerticalMargin( enode, margin_bottom, break_after, false, fork_mode_change_break );
+                 return;
+             }
+             break;
+@@ -9777,7 +9802,7 @@ void renderBlockElementEnhanced( FlowState * flow, ldomNode * enode, int x, int
+                     }
+                 }
+ 
+-                flow->addVerticalMargin( enode, margin_bottom, break_after );
++                flow->addVerticalMargin( enode, margin_bottom, break_after, false, fork_mode_change_break );
+                 if ( no_margin_collapse ) {
+                     // Push our margin so it does not get collapsed with some later one
+                     flow->pushVerticalMargin();
+@@ -10294,7 +10319,7 @@ void renderBlockElementEnhanced( FlowState * flow, ldomNode * enode, int x, int
+                     }
+                 }
+ 
+-                flow->addVerticalMargin( enode, margin_bottom, break_after );
++                flow->addVerticalMargin( enode, margin_bottom, break_after, false, fork_mode_change_break );
+                 if ( no_margin_collapse ) {
+                     // Push our margin so it does not get collapsed with some later one
+                     flow->pushVerticalMargin();
+diff --git a/crengine/src/lvtinydom.cpp b/crengine/src/lvtinydom.cpp
+index 66e3dbd..2d6b96e 100644
+--- a/crengine/src/lvtinydom.cpp
++++ b/crengine/src/lvtinydom.cpp
+@@ -592,11 +592,18 @@ struct SimpleCacheFileHeader
+     }
+ };
+ 
++// FORK (tategumi): bump when page-layout semantics change (e.g. the
++// mixed-writing-mode page breaks in vertical-rl), so that cache files written
++// by an older engine are rejected instead of silently reusing a stale page
++// split. Older (and upstream) cache files carry 0 here, so they are rejected
++// once. Bump this whenever a layout change must invalidate the page list.
++#define CRE_LAYOUT_ENGINE_REVISION 1
++
+ struct CacheFileHeader : public SimpleCacheFileHeader
+ {
+     lUInt32 _fsize;
+-    // Padding to explicitly align the index block structure, and that can be
+-    // be initialized to zero for reproducible file contents.
++    // FORK (tategumi): was "explicit padding, zero for reproducible file
++    // contents"; now carries CRE_LAYOUT_ENGINE_REVISION (0 in old caches).
+     lUInt32 _padding;
+     CacheFileItem _indexBlock; // index array block parameters,
+     // duplicate of one of index records which contains
+@@ -616,10 +623,17 @@ struct CacheFileHeader : public SimpleCacheFileHeader
+             printf("CRE: ignoring cache file (dom version mismatch)\n");
+             return false;
+         }
++        if ( _padding != CRE_LAYOUT_ENGINE_REVISION ) {
++            // FORK (tategumi): the cache file was written by an engine with
++            // different layout semantics: its page split can not be trusted.
++            CRLog::error("CacheFileHeader::validate: layout engine revision mismatch");
++            printf("CRE: ignoring cache file (layout engine revision mismatch)\n");
++            return false;
++        }
+         return true;
+     }
+     CacheFileHeader( CacheFileItem * indexRec, int fsize, lUInt32 dirtyFlag, lUInt32 domVersion )
+-    : SimpleCacheFileHeader(dirtyFlag, domVersion), _padding(0), _indexBlock(0,0)
++    : SimpleCacheFileHeader(dirtyFlag, domVersion), _padding(CRE_LAYOUT_ENGINE_REVISION), _indexBlock(0,0)
+     {
+         if ( indexRec ) {
+             memcpy((void*)&_indexBlock, indexRec, sizeof(CacheFileItem));
